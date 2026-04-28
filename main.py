@@ -1,5 +1,6 @@
 import os
 import cv2
+import base64
 import numpy as np
 import pandas as pd
 from contextlib import asynccontextmanager
@@ -8,30 +9,37 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel
 from ultralytics import YOLO
 
+# 1. Configuration & Setup
 load_dotenv()
 
 API_KEY = os.getenv("API_KEY", "secret-key")
 MODEL_PATH = os.getenv("MODEL_PATH", "yolo26n-seg.pt")
 DATA_PATH = os.getenv("DATA_PATH", "nutrition_dataset_large.csv")
 
-# Global variables for memory management
+# Global variables to store heavy objects in RAM
 model = None
 df = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model and data on startup to avoid overhead during requests."""
+    """
+    Handles startup and shutdown. This is crucial for Render 
+    to prevent reloading the model on every request (which causes crashes).
+    """
     global model, df
-    print("Loading model and dataset...")
+    print(f"--- Booting up: Loading {MODEL_PATH} ---")
     
-    # Load model to CPU explicitly
+    # Load model and force to CPU
     model = YOLO(MODEL_PATH)
     model.to("cpu")
     
-    # Load dataset - only keep necessary columns to save RAM
+    # Load dataset safely
     try:
-        df = pd.read_csv(DATA_PATH)
-        df["food_name"] = df["food_name"].astype(str).str.lower()
+        if os.path.exists(DATA_PATH):
+            df = pd.read_csv(DATA_PATH)
+            df["food_name"] = df["food_name"].astype(str).str.lower()
+        else:
+            print(f"Warning: Dataset not found at {DATA_PATH}")
     except Exception as e:
         print(f"Error loading dataset: {e}")
     
@@ -42,23 +50,30 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Food Nutrition API", lifespan=lifespan)
 
-food_map = {"pizza_slice": "pizza", "burger_big": "burger"}
+# 2. Helper Logic
+food_map = {
+    "pizza_slice": "pizza", 
+    "burger_big": "burger"
+}
 
 def get_nutrition(food_list):
     nutrition_list = []
-    if df is None: return []
+    if df is None:
+        return []
     for food in food_list:
-        food = food_map.get(food, food)
-        match = df[df["food_name"] == food.lower()]
+        clean_name = food_map.get(food, food).lower()
+        match = df[df["food_name"] == clean_name]
         if not match.empty:
             nutrition_list.append(match.iloc[0].to_dict())
     return nutrition_list
 
 def calculate_total(nutrition_list):
-    total = {"calories": 0, "protein": 0, "fat": 0, "carbs": 0}
+    total = {"calories": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0}
     for item in nutrition_list:
         for key in total:
-            total[key] += float(item.get(key, 0))
+            # Ensure we handle potential NaN or missing values
+            val = item.get(key, 0)
+            total[key] += float(val) if pd.notnull(val) else 0.0
     return total
 
 def verify_api_key(x_api_key: str | None = Header(default=None)):
@@ -66,9 +81,14 @@ def verify_api_key(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return x_api_key
 
+# 3. API Endpoints
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "model_loaded": model is not None}
+    return {
+        "status": "online", 
+        "model_loaded": model is not None,
+        "dataset_loaded": df is not None
+    }
 
 @app.post("/predict")
 async def predict(
@@ -76,30 +96,50 @@ async def predict(
     x_api_key: str = Depends(verify_api_key),
 ):
     try:
-        image_bytes = await image.read()
-        image_np = np.frombuffer(image_bytes, np.uint8)
-        image_data = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
+        # Read and decode image
+        contents = await image.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        if image_data is None:
-            raise HTTPException(status_code=400, detail="Invalid image")
+        if img is None:
+            raise HTTPException(status_code=400, detail="Could not decode image.")
 
-        # Resize to 320 for much faster inference on Render's weak CPU
-        image_data = cv2.resize(image_data, (320, 320))
+        # Resize for performance (Render CPU optimization)
+        img_resized = cv2.resize(img, (320, 320))
 
-        # Perform inference
-        results = model.predict(image_data, imgsz=320, verbose=False)
+        # Run YOLO Inference
+        # imgsz=320 must match the resize above
+        results = model.predict(img_resized, imgsz=320, verbose=False)
         
-        detected_foods = list(set([model.names[int(box.cls[0])] for r in results for box in r.boxes]))
-        
+        # --- Create Annotated Image Overlay ---
+        # plot() generates an image with bounding boxes, labels, and masks
+        annotated_img = results[0].plot()
+        _, buffer = cv2.imencode('.jpg', annotated_img)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        # Extract unique detected food labels
+        detected_foods = []
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                label = model.names[cls_id]
+                if label not in detected_foods:
+                    detected_foods.append(label)
+
+        # Gather nutrition data
         nutrition_data = get_nutrition(detected_foods)
-        total = calculate_total(nutrition_data)
+        total_stats = calculate_total(nutrition_data)
 
+        # Final Response
         return {
             "detected_foods": detected_foods,
             "nutrition_data": nutrition_data,
-            "total": total,
-            "summary": "High calorie" if total["calories"] > 700 else "Balanced"
+            "total": total_stats,
+            "summary": "High calorie" if total_stats["calories"] > 700 else "Balanced",
+            "image_overlay": f"data:image/jpeg;base64,{img_base64}"
         }
 
     except Exception as e:
+        # Log the error for Render dashboard debugging
+        print(f"Prediction Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
