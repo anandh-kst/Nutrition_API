@@ -1,0 +1,28 @@
+# Python environment
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables (Crucial for security!)
+.env
+
+# Large files / ML Models
+# If your model is >50MB, it's better to host it elsewhere, 
+# but if it's small (nano version), you can comment this out to include it.
+# *.pt
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Data and Logs
+*.log
+# nutrition_dataset_large.csv  <-- Un-comment if you want to keep data out of Git

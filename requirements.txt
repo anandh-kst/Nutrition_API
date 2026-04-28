@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+python-dotenv
+ultralytics
+# We use standard opencv for your local Windows test, 
+# Render will handle it fine too.
+opencv-python
+pandas
+numpy
+pydantic
+pillow
+python-multipart
+# This tells pip to find torch on the CPU-specific link
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+torchvision --extra-index-url https://download.pytorch.org/whl/cpu
